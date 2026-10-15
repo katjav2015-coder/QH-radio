@@ -17,4 +17,43 @@ io.on('connection',s=>{s.emit('radioStatus',status);s.emit('count',users.size);
  s.on('join',raw=>{const name=safe(raw).slice(0,22);if(!name||/radiobot|admin|beheerder/i.test(name))return s.emit('notice','Kies een andere nickname.');users.set(s.id,name);s.emit('joined',name);io.emit('count',users.size);io.to('djs').emit('djUsers',[...users].map(([id,n])=>({id,name:n})));bot(`Welkom bij QH Radio, ${name}! 🌈`)});
  s.on('message',raw=>{const name=users.get(s.id);if(!name)return;const msg=safe(raw).slice(0,350);if(!msg)return;const now=Date.now();if((muted.get(s.id)||0)>now)return s.emit('notice','Je chatpauze is nog actief.');if(now-(lastMessages.get(s.id)||0)<1500)return s.emit('notice','Wacht even voor je opnieuw iets stuurt.');lastMessages.set(s.id,now);if(bad.test(msg)||threats.test(msg)){const n=(strikes.get(s.id)||0)+1;strikes.set(s.id,n);s.emit('notice',`Waarschuwing ${n}: kwetsende taal is niet toegestaan. Bericht geblokkeerd.`);io.to('djs').emit('djAlert',{name,text:msg,count:n});if(n>=3){muted.set(s.id,now+600000);s.emit('notice','Je hebt 10 minuten chatpauze.')}return}io.emit('message',{name,text:msg,time:now});if(now-lastBot>45000&&/\b(hallo|hey|hoi|muziek|radio|gezellig)\b/i.test(msg)){lastBot=now;setTimeout(()=>bot('Leuk dat jullie er zijn! 🎶 Wat luisteren jullie graag?'),1200)}});
  s.on('disconnect',()=>{users.delete(s.id);strikes.delete(s.id);muted.delete(s.id);lastMessages.delete(s.id);io.emit('count',users.size);io.to('djs').emit('djUsers',[...users].map(([id,n])=>({id,name:n})))});
-});app.get('/health',(_,r)=>r.json({ok:true}));server.listen(process.env.PORT||3000,()=>console.log('QH Radio gestart'));
+});
+// Experimentele browser-audiostream: WebRTC-signalisatie, geen audio op de server.
+let activeDjSocket = null;
+io.on('connection', socket => {
+  socket.emit('audioAvailability', Boolean(activeDjSocket));
+  socket.on('audioStart', () => {
+    if (!socket.data.dj) return socket.emit('audioError', 'Log eerst in als DJ.');
+    if (activeDjSocket && activeDjSocket !== socket.id && io.sockets.sockets.has(activeDjSocket))
+      return socket.emit('audioError', 'Er zendt al een andere DJ uit.');
+    activeDjSocket = socket.id;
+    socket.emit('audioStarted');
+    io.emit('audioAvailability', true);
+  });
+  socket.on('audioStop', () => {
+    if (activeDjSocket !== socket.id) return;
+    activeDjSocket = null;
+    io.emit('audioAvailability', false);
+    io.emit('audioEnded');
+  });
+  socket.on('audioListen', () => {
+    if (!activeDjSocket || !io.sockets.sockets.has(activeDjSocket))
+      return socket.emit('audioError', 'Er is momenteel geen DJ-uitzending.');
+    io.to(activeDjSocket).emit('audioListener', socket.id);
+  });
+  socket.on('audioSignal', ({ to, description, candidate } = {}) => {
+    if (typeof to !== 'string' || !io.sockets.sockets.has(to)) return;
+    if (socket.id !== activeDjSocket && to !== activeDjSocket) return;
+    if (description && !['offer','answer'].includes(description.type)) return;
+    io.to(to).emit('audioSignal', { from: socket.id, description, candidate });
+  });
+  socket.on('disconnect', () => {
+    if (activeDjSocket === socket.id) {
+      activeDjSocket = null;
+      io.emit('audioAvailability', false);
+      io.emit('audioEnded');
+    }
+  });
+});
+
+app.get('/health',(_,r)=>r.json({ok:true}));server.listen(process.env.PORT||3000,()=>console.log('QH Radio gestart'));
